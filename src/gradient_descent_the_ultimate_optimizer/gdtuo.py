@@ -51,6 +51,14 @@ class Optimizable:
         ''' Update parameters '''
         pass
 
+    def end(self):
+        if hasattr(self, "all_params_with_gradients"):
+            for param in self.all_params_with_gradients:
+                param.grad = None
+            self.all_params_with_gradients.clear()
+        if hasattr(self, "optimizer"):
+            self.optimizer.end()
+
 class NoOpOptimizer(Optimizable):
     '''
     NoOpOptimizer sits on top of a stack, and does not affect what lies below.
@@ -366,3 +374,74 @@ class ModuleWrapper(Optimizable):
 
         for k, v in self.module.named_parameters(recurse=True):
             set_param(self.module, k, v)
+
+class Adai(Optimizable):
+    '''
+    A hyperoptimizable Adai (Adaptive Inertia) optimizer.
+    '''
+    def clamp(x):
+        return (x.tanh() + 1.) / 2.
+
+    def unclamp(y):
+        z = y * 2. - 1.
+        return ((1. + z) / (1. - z)).log() / 2.
+
+
+    def __init__(self, alpha=0.001, beta0=0.1, beta2=0.99, log_eps=-3., optimizer=NoOpOptimizer()):
+        self.eps = 10. ** log_eps
+        parameters = {
+            'alpha': torch.tensor(alpha),
+            'beta0': torch.tensor(beta0),
+            'beta2': Adai.unclamp(torch.tensor(beta2)),
+        }
+        super().__init__(parameters, optimizer)
+        self.num_stepments = 0
+        self.cache = {}
+
+    def step(self, params):
+        self.num_stepments += 1
+        self.optimizer.step(self.parameters)
+        t = self.num_stepments
+        beta0 = self.parameters['beta0']
+        beta2 = Adam.clamp(self.parameters['beta2'])
+        v_hat_sum = torch.tensor(0.)
+        param_size = 0
+        for name, param in params.items():
+            if param.grad is None:
+                print(f"WARNING: the gradient of {name} is None!")
+                continue
+            if name not in self.cache:
+                self.cache[name] = {
+                    'm': torch.zeros_like(param),
+                    'v': torch.zeros_like(param),
+                    'beta1_prod': torch.ones_like(param)
+                }
+            param_size += param.numel()
+            g = param.grad.detach()
+            self.cache[name]['v'] = v =\
+                beta2 * self.cache[name]['v'].detach() + (1. - beta2) * g * g
+            v_hat_sum += v.sum() / (1. - beta2 ** float(t))
+            self.all_params_with_gradients.append(v)
+        v_hat_mean = v_hat_sum / param_size
+        for name, param in params.items():
+            if param.grad is None:
+                continue
+            g = param.grad.detach()
+            v_hat = self.cache[name]['v'] / (1. - beta2 ** float(t))
+            beta1 =\
+                (1. - (beta0 / v_hat_mean) * v_hat).clamp(0, 1-self.eps) if v_hat_mean != 0 \
+                else (1-self.eps) * torch.ones_like(param)
+            self.cache[name]['beta1_prod'] = beta1_prod = \
+            self.cache[name]['beta1_prod'].detach() * beta1
+            self.cache[name]['m'] = m =\
+                beta1 * self.cache[name]['m'].detach() + (1. - beta1) * g
+            self.all_params_with_gradients.append(m)
+            # self.all_params_with_gradients.append(beta1_prod)
+
+            m_hat = m / (1. - beta1_prod)
+
+            dparam = m_hat
+            params[name] = param.detach() - self.parameters['alpha'] * dparam
+            
+    def __str__(self):
+        return 'adai / ' + str(self.optimizer)
